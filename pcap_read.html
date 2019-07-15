@@ -1,0 +1,231 @@
+<input type="file" id="files" name="file" accept=".pcap" />
+<button id="next" record-startbyte="0">next</button>
+<div id="global_header"></div>
+<div id="range"></div>
+<div id="packet_header"></div>
+<pre>
+<div id="hexdump"></div>
+</pre>
+
+<script>
+  var GLOBAL_HEADER_SIZE = 24;
+  var TCPDUMP_MAGIC = 0xa1b2c3d4;
+  var KUZNETZOV_TCPDUMP_MAGIC	= 0xa1b2cd34;
+  var NSEC_TCPDUMP_MAGIC = 0xa1b23c4d;
+  var PACKET_HEADER_SIZE = 16;
+  var little_endian = true;
+
+  function hexDump(start, arrayBuffer) {
+    var uint8array = new Uint8Array(arrayBuffer);
+    var dump = [];
+    for (var i = 0; i < uint8array.byteLength; i += 16) {
+      var hex = [];
+      var ascii = [];
+      hex.push(('0000000' + (start + i).toString(16)).slice(-8));
+      for (var j = 0, addr = i; j < 16; j++, addr++) {
+        if (j % 8 == 0) {
+          hex.push('');
+        }
+        if (addr < uint8array.byteLength) {
+          var c = uint8array[addr];
+          hex.push(('0' + c.toString(16)).slice(-2));
+          ascii.push((c >= 32 && c < 127) ? String.fromCharCode(c) : '.');
+        }
+        else {
+          hex.push('  ');
+        }
+      }
+      dump.push(hex.join(' '));
+      dump.push('  ');
+      dump.push(ascii.join(''));
+      dump.push('\r\n');
+    }
+    return dump.join('');
+  }
+
+  class DataViewEx extends DataView {
+    constructor(arrayBuffer) {
+      super(arrayBuffer);
+    }
+
+    getUint16(byteOffset) {
+      return super.getUint16(byteOffset, little_endian);
+    }
+
+    getUint32(byteOffset) {
+      return super.getUint32(byteOffset, little_endian);
+    }
+  }
+
+  class GlobalHeader {
+    constructor(arrayBuffer) {
+      if (arrayBuffer.byteLength < GLOBAL_HEADER_SIZE) {
+        throw new Error('truncated dump file');
+      }
+      var dataView = new DataViewEx(arrayBuffer);
+      this._get_global_header(dataView);
+    }
+
+    _get_magic_number(dataView) {
+      little_endian = true;
+      this.magic_number = dataView.getUint32(0);
+      if (this.magic_number === TCPDUMP_MAGIC ||
+        this.magic_number === KUZNETZOV_TCPDUMP_MAGIC ||
+        this.magic_number === NSEC_TCPDUMP_MAGIC) {
+        return
+      }
+      little_endian = !little_endian;
+      this.magic_number = dataView.getUint32(0);
+      if (this.magic_number === TCPDUMP_MAGIC ||
+        this.magic_number === KUZNETZOV_TCPDUMP_MAGIC ||
+        this.magic_number === NSEC_TCPDUMP_MAGIC) {
+        return
+      }
+      throw new Error(this.magic_number.toString(16) + ': unknown file format');
+    }
+
+    _get_global_header(dataView) {
+      this._get_magic_number(dataView);
+      this.version_major = dataView.getUint16(4);
+      this.version_minor = dataView.getUint16(6);
+      this.thiszone = dataView.getUint32(8);
+      this.sigfigs = dataView.getUint32(12);
+      this.snaplen = dataView.getUint32(16);
+      this.snapshot = this.snaplen;
+      this.network = dataView.getUint32(20);
+      if (this.magic_number === KUZNETZOV_TCPDUMP_MAGIC) {
+        var DLT_EN10MB = 1;
+        if (this.network === DLT_EN10MB) {
+          this.snapshot += 14;
+        }
+      }
+      this.nsec = false;
+      if (this.magic_number === NSEC_TCPDUMP_MAGIC) {
+        this.nsec = true;
+      }
+    }
+
+    toString() {
+      return [
+        'magic_number: 0x', this.magic_number.toString(16),
+        ', version: ', this.version_major, '.', this.version_minor,
+        ', thiszone: ', this.thiszone,
+        ', sigfigs: ', this.sigfigs,
+        ', snaplen: ', this.snaplen,
+        ', snapshot: ', this.snapshot,
+        ', network: ', this.network,
+        ', nsec: ', this.nsec
+      ].join('');
+    }
+  }
+
+  class PacketHeader {
+    constructor(arrayBuffer) {
+      if (arrayBuffer.byteLength < PACKET_HEADER_SIZE) {
+        throw new Error('truncated dump file');
+      }
+      var dataView = new DataViewEx(arrayBuffer);
+      this._get_packet_header(dataView);
+    }
+
+    _get_packet_header(dataView) {
+      this.ts_sec = dataView.getUint32(0);
+      this.ts_usec = dataView.getUint32(4);
+      this.incl_len = dataView.getUint32(8);
+      this.orig_len = dataView.getUint32(12);
+    }
+
+    toString() {
+      return [
+        'ts_sec: ', this.ts_sec,
+        ', ts_usec: ', this.ts_usec,
+        ', incl_len: ', this.incl_len,
+        ', orig_len: ', this.orig_len
+      ].join('');
+    }
+  }
+
+  function readPacket(arrayBuffer, file, start) {
+    var packet_header = new PacketHeader(arrayBuffer);
+    document.getElementById('packet_header').textContent =
+      packet_header.toString();
+    var stop = start + PACKET_HEADER_SIZE + packet_header.incl_len;
+    var reader = new FileReader();
+    reader.onloadend = function(e) {
+      if (e.target.readyState == FileReader.DONE) {
+        document.getElementById('range').textContent =
+          ['Read bytes: ', start + 1, ' - ', stop,
+          ' of ', file.size, ' byte file'].join('');
+        var next = stop;
+        if (next >= file.size) {
+          next = GLOBAL_HEADER_SIZE;
+        }
+        document.getElementById('next').setAttribute('record-startbyte',
+          next);
+        document.getElementById('hexdump').textContent = hexDump(start, e.target.result);
+      }
+    };
+    reader.readAsArrayBuffer(file.slice(start, stop));
+  }
+
+  document.querySelector('#files').addEventListener('change', function(e) {
+    if (!e.target.files.length) {
+      return;
+    }
+    var file = e.target.files[0];
+    var reader = new FileReader();
+    reader.onloadend = function(e) {
+      if (e.target.readyState == FileReader.DONE) {
+        try {
+          var global_header = new GlobalHeader(e.target.result);
+          document.getElementById('global_header').textContent =
+            global_header.toString();
+          document.getElementById('range').textContent =
+            ['Read bytes: ', 1, ' - ', GLOBAL_HEADER_SIZE,
+            ' of ', file.size, ' byte file'].join('');
+          document.getElementById('next').setAttribute('record-startbyte',
+            GLOBAL_HEADER_SIZE);
+        }
+        catch(e) {
+          document.getElementById('global_header').textContent = e;
+        }
+        document.getElementById('hexdump').textContent = hexDump(0, e.target.result);
+      }
+    };
+    reader.readAsArrayBuffer(file.slice(0, GLOBAL_HEADER_SIZE));
+  }, false);
+
+  document.querySelector('#files').addEventListener('click', function(e) {
+    document.getElementById('files').value = '';
+    document.getElementById('global_header').textContent = '';
+    document.getElementById('range').textContent = '';
+    document.getElementById('packet_header').textContent = '';
+    document.getElementById('hexdump').textContent = '';
+  }, false);
+
+  document.querySelector('#next').addEventListener('click', function(e) {
+    var files = document.getElementById('files').files;
+    if (!files.length) {
+      alert('Please select a file!');
+      return;
+    }
+    var file = files[0];
+    var start = parseInt(e.target.getAttribute('record-startbyte'));
+    if (!start) {
+      return;
+    }
+    var stop = start + PACKET_HEADER_SIZE;
+    var reader = new FileReader();
+    reader.onloadend = function(e) {
+      if (e.target.readyState == FileReader.DONE) {
+        try {
+          readPacket(e.target.result, file, start);
+        }
+        catch(e) {
+          document.getElementById('packet_header').textContent = e;
+        }
+      }
+    };
+    reader.readAsArrayBuffer(file.slice(start, stop + 100));
+  }, false);
+</script>

@@ -1,0 +1,89 @@
+<input type="file" id="files" name="file" />
+<span class="readBytesButtons">
+<button id="prev" startbyte="0">prev</button>
+<button id="next" startbyte="0">next</button>
+</span>
+<div id="range"></div>
+<pre>
+<div id="strings"></div>
+</pre>
+
+<script>
+  function strings(start, arrayBuffer) {
+    var WORDLENGTH = 3;
+    var uint8array = new Uint8Array(arrayBuffer);
+    var strings = [];
+    var word = [];
+    for (var i = 0; i < uint8array.byteLength; i++) {
+      var c = uint8array[i];
+      if (c > 32 && c < 127) {
+        word.push(String.fromCharCode(c));
+      }
+      else {
+        if (word.length >= WORDLENGTH) {
+          strings.push(word.join(''));
+        }
+        word = [];
+      }
+    }
+    if (word.length >= WORDLENGTH) {
+      strings.push(word.join(''));
+    }
+    return strings.join('\r\n');
+  }
+
+  function readBuffer(file, start) {
+    var BLOCKSIZE = 1024;
+    var stop = start + BLOCKSIZE;
+    if (stop > file.size) {
+      stop = file.size;
+    }
+    var reader = new FileReader();
+    reader.onloadend = function(e) {
+      if (e.target.readyState == FileReader.DONE) {
+        document.getElementById('range').textContent =
+          ['Read bytes: ', start + 1, ' - ', stop,
+          ' of ', file.size, ' byte file'].join('');
+        document.getElementById('strings').textContent = strings(start, e.target.result);
+        var prev = start - BLOCKSIZE;
+        if (prev < 0) {
+          prev = parseInt((file.size - 1) / BLOCKSIZE) * BLOCKSIZE;
+        }
+        var next = stop;
+        if (next >= file.size) {
+          next = 0;
+        }
+        document.getElementById('prev').setAttribute('startbyte', prev);
+        document.getElementById('next').setAttribute('startbyte', next);
+      }
+    };
+    reader.readAsArrayBuffer(file.slice(start, stop));
+  }
+
+  document.querySelector('#files').addEventListener('change', function(e) {
+    var files = e.target.files;
+    if (!files.length) {
+      return;
+    }
+    readBuffer(files[0], 0);
+  }, false);
+
+  document.querySelector('#files').addEventListener('click', function(e) {
+    document.getElementById('files').value = '';
+    document.getElementById('range').textContent = '';
+    document.getElementById('strings').textContent = '';
+  }, false);
+
+  document.querySelector('.readBytesButtons').addEventListener('click', function(e) {
+    if (e.target.tagName.toLowerCase() != 'button') {
+      return;
+    }
+    var start = parseInt(e.target.getAttribute('startbyte'));
+    var files = document.getElementById('files').files;
+    if (!files.length) {
+      alert('Please select a file!');
+      return;
+    }
+    readBuffer(files[0], start);
+  }, false);
+</script>
