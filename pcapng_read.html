@@ -1,0 +1,496 @@
+<input type="file" id="files" name="file" accept=".pcapng" />
+<button id="prev" startbyte="0">prev</button>
+<button id="next" startbyte="0">next</button>
+<div id="block"></div>
+<div id="range"></div>
+<pre>
+<div id="hexdump"></div>
+</pre>
+
+<script>
+  var BYTE_ORDER_MAGIC = 0x1A2B3C4D;
+  var BLOCK_HEADER_SIZE = 8;
+  var BLOCK_TAIL_SIZE = 4;
+  var SESSION_BLOCK_SIZE = 24;
+  var INTERFACE_DESCRIPTION_BLOCK_SIZE = 16;
+  var ENHANCED_PACKET_BLOCK_SIZE = 28;
+  var INTERFACE_STATISTICS_BLOCK_SIZE = 20;
+  var BLOCK_SIZE = 12;
+  var little_endian = true;
+
+  function hex8(u) {
+    return ('00' + u.toString(16)).slice(-2);
+  }
+
+  function hex16(u) {
+    return ('000' + u.toString(16)).slice(-4);
+  }
+
+  function hex32(u) {
+    return ('0000000' + u.toString(16)).slice(-8);
+  }
+
+  function ascii(arrayBuffer) {
+    var uint8array = new Uint8Array(arrayBuffer);
+    var ascii = [];
+    for (var i = 0; i < uint8array.byteLength; i++) {
+      var c = uint8array[i];
+      if (c >= 32 && c < 127) {
+        ascii.push(String.fromCharCode(c));
+      }
+    }
+    return ascii.join('');
+  }
+
+  function hexDump(start, arrayBuffer) {
+    var uint8array = new Uint8Array(arrayBuffer);
+    var dump = [];
+    for (var i = 0; i < uint8array.byteLength; i += 16) {
+      var hex = [];
+      var ascii = [];
+      hex.push(hex32(start + i));
+      for (var j = 0, addr = i; j < 16; j++, addr++) {
+        if (j % 8 == 0) {
+          hex.push('');
+        }
+        if (addr < uint8array.byteLength) {
+          var c = uint8array[addr];
+          hex.push(hex8(c));
+          ascii.push((c >= 32 && c < 127) ? String.fromCharCode(c) : '.');
+        }
+        else {
+          hex.push('  ');
+        }
+      }
+      dump.push(hex.join(' '));
+      dump.push('  ');
+      dump.push(ascii.join(''));
+      dump.push('\r\n');
+    }
+    return dump.join('');
+  }
+
+  class DataViewEx extends DataView {
+    constructor(arrayBuffer) {
+      super(arrayBuffer);
+    }
+
+    getUint16(byteOffset) {
+      return super.getUint16(byteOffset, little_endian);
+    }
+
+    getUint32(byteOffset) {
+      return super.getUint32(byteOffset, little_endian);
+    }
+
+    getUint64(byteOffset) {
+      return super.getUint32(byteOffset, little_endian);
+    }
+
+    getByteOrderMagic(byteOffset) {
+      little_endian = true;
+      var magic = this.getUint32(byteOffset);
+      if (magic == BYTE_ORDER_MAGIC) {
+        return magic;
+      }
+      little_endian = !little_endian;
+      magic = this.getUint32(8);
+      if (magic == BYTE_ORDER_MAGIC) {
+        return magic;
+      }
+      throw new Error(magic.toString(16) + ': unknown magic number');
+    }
+  }
+
+  class GeneralOption {
+    constructor(t, l, v) {
+      this.code = t;
+      this.length = l;
+      this.value = v;
+    }
+
+    toString() {
+      return [
+        '[type: 0x', hex16(this.code),
+        ', length: ', this.length,
+        ', value: "', ascii(this.value), '"',
+        ']'
+      ].join('');
+    }
+  }
+
+  class GeneralBlock {
+    constructor(dataView) {
+      this._parse_block(dataView);
+    }
+
+    _parse_block(dataView) {
+      if (dataView.byteLength < BLOCK_SIZE) {
+        throw new Error('truncated block');
+      }
+      this.type = dataView.getUint32(0);
+      this.total_length = dataView.getUint32(4);
+      if (this.total_length <= BLOCK_SIZE) {
+        throw new Error('invalid block');
+      }
+    }
+
+    _type_name(type) {
+      var names = {
+        0x00000001: 'Interface Description Block',
+        0x00000002: 'Packet Block',
+        0x00000003: 'Simple Packet Block',
+        0x00000004: 'Name Resolution Block',
+        0x00000005: 'Interface Statistics Block',
+        0x00000006: 'Enhanced Packet Block',
+        0x00000007: '	IRIG Timestamp Block',
+        0x00000008: 'Arinc 429 in AFDX Encapsulation Information Block',
+        0x0A0D0D0A: 'Section Header Block'
+      };
+      var name = names[type];
+      if (!name) {
+        name = 'unknown';
+      }
+      return name;
+    }
+
+    _parse_options(arrayBuffer) {
+      var dataView = new DataViewEx(arrayBuffer);
+      var options = [];
+      for (var i = 0; i < dataView.byteLength; ) {
+        if (i + 4 > dataView.byteLength) {
+          throw new Error('invalid option');
+        }
+        var option_code = dataView.getUint16(i);
+        var option_length = dataView.getUint16(i + 2);
+        var total_length = parseInt((option_length + 3) / 4) * 4;
+        var option_value = null;
+
+        if (option_length > 0) {
+          var start = i + 4;
+          var stop = i + 4 + option_length;
+          if (stop >= dataView.byteLength) {
+            throw new Error('invalid option');
+          }
+          option_value = arrayBuffer.slice(start, stop);
+        }
+        options.push(new GeneralOption(option_code, option_length, option_value));
+        if (option_code == 0) {
+          break;
+        }
+        i += 4 + total_length;
+      }
+      return options;
+    }
+
+    toString() {
+      return [
+        'type: 0x', hex32(this.type),
+        ' (', this._type_name(this.type), ')',
+        ', length: ', this.total_length
+      ].join('');
+    }
+  }
+
+  class SectionHeaderBlock extends GeneralBlock {
+    _parse_block(dataView) {
+      var total_length = dataView.byteLength;
+      if (total_length < SESSION_BLOCK_SIZE) {
+        throw new Error('truncated block');
+      }
+      this.type = dataView.getUint32(0);
+      if (this.type !== 0x0A0D0D0A) {
+        throw new Error(this.type.toString(16) + ': unknown file format');
+      }
+      this.total_length = dataView.getUint32(4);
+      if (this.total_length < SESSION_BLOCK_SIZE) {
+        throw new Error('truncated block');
+      }
+      this.byte_order_magic = dataView.getByteOrderMagic(8);
+      this.major_version = dataView.getUint16(12);
+      this.minor_version = dataView.getUint16(14);
+      this.section_length = dataView.getUint64(16);
+      var start = 24;
+      var stop = dataView.byteLength - BLOCK_TAIL_SIZE;
+      this.options = this._parse_options(dataView.buffer.slice(start, stop));
+    }
+
+    toString() {
+      return [
+        'type: 0x', hex32(this.type),
+        ' (', this._type_name(this.type), ')',
+        ', length: ', this.total_length,
+        ', byte order magic: ', hex32(this.byte_order_magic),
+        ', version: ', this.major_version, '.', this.minor_version,
+        ', section length: ', this.section_length,
+        ', options: ', this.options
+      ].join('');
+    }
+  }
+
+  class InterfaceDescriptionBlock extends GeneralBlock {
+    _parse_block(dataView) {
+      var total_length = dataView.byteLength;
+      if (total_length < INTERFACE_DESCRIPTION_BLOCK_SIZE) {
+        throw new Error('truncated block');
+      }
+      this.type = dataView.getUint32(0);
+      if (this.type !== 0x00000001) {
+        throw new Error(this.type.toString(16) + ': unknown file format');
+      }
+      this.total_length = dataView.getUint32(4);
+      if (this.total_length < INTERFACE_DESCRIPTION_BLOCK_SIZE) {
+        throw new Error('truncated block');
+      }
+      this.link_type = dataView.getUint16(8);
+      this.reserved = dataView.getUint16(10);
+      this.snap_len = dataView.getUint32(12);
+      var start = 16;
+      var stop = dataView.byteLength - BLOCK_TAIL_SIZE;
+      this.options = this._parse_options(dataView.buffer.slice(start, stop));
+    }
+
+    toString() {
+      return [
+        'type: 0x', hex32(this.type),
+        ' (', this._type_name(this.type), ')',
+        ', length: ', this.total_length,
+        ', link type: ', this.link_type,
+        ', snap length: ', this.snap_len,
+        ', options: ', this.options
+      ].join('');
+    }
+  }
+
+  class InterfaceStatisticsBlock extends GeneralBlock {
+    _parse_block(dataView) {
+      var total_length = dataView.byteLength;
+      if (total_length < INTERFACE_STATISTICS_BLOCK_SIZE) {
+        throw new Error('truncated block');
+      }
+      this.type = dataView.getUint32(0);
+      if (this.type !== 0x00000005) {
+        throw new Error(this.type.toString(16) + ': unknown file format');
+      }
+      this.total_length = dataView.getUint32(4);
+      if (this.total_length < INTERFACE_STATISTICS_BLOCK_SIZE) {
+        throw new Error('truncated block');
+      }
+      this.interface_id = dataView.getUint32(8);
+      this.timestamp_h = dataView.getUint32(12);
+      this.timestamp_l = dataView.getUint32(16);
+      var start = 20;
+      var stop = dataView.byteLength - BLOCK_TAIL_SIZE;
+      this.options = this._parse_options(dataView.buffer.slice(start, stop));
+    }
+
+    toString() {
+      return [
+        'type: 0x', hex32(this.type),
+        ' (', this._type_name(this.type), ')',
+        ', length: ', this.total_length,
+        ', interface id: ', this.interface_id,
+        ', timestamp high: ', this.timestamp_h,
+        ', timestamp low: ', this.timestamp_l,
+        ', options: ', this.options
+      ].join('');
+    }
+  }
+
+  class EnhancedPacketBlock extends GeneralBlock {
+    _parse_block(dataView) {
+      var total_length = dataView.byteLength;
+      if (total_length < ENHANCED_PACKET_BLOCK_SIZE) {
+        throw new Error('truncated block');
+      }
+      this.type = dataView.getUint32(0);
+      if (this.type !== 0x00000006) {
+        throw new Error(this.type.toString(16) + ': unknown file format');
+      }
+      this.total_length = dataView.getUint32(4);
+      if (this.total_length < ENHANCED_PACKET_BLOCK_SIZE) {
+        throw new Error('truncated block');
+      }
+      this.interface_id = dataView.getUint32(8);
+      this.timestamp_h = dataView.getUint32(12);
+      this.timestamp_l = dataView.getUint32(16);
+      this.captured_len = dataView.getUint32(20);
+      this.packet_len = dataView.getUint32(24);
+      var packet_len = parseInt((this.packet_len + 3) / 4) * 4;
+      var start = 28;
+      var stop = start + packet_len;
+      this.pakcet_data = dataView.buffer.slice(start, stop);
+      start = stop;
+      stop = dataView.byteLength - BLOCK_TAIL_SIZE;
+      this.options = this._parse_options(dataView.buffer.slice(start, stop));
+    }
+
+    _packet_data_summary(arrayBuffer) {
+      var uint8array = new Uint8Array(arrayBuffer, 0, 8);
+        var hex = [];
+        for (var i = 0; i < uint8array.byteLength; i++) {
+          hex.push(hex8(uint8array[i]));
+        }
+        if (arrayBuffer.byteLength > 8) {
+          hex.push('...');
+        }
+        return hex.join(' ');
+    }
+
+    toString() {
+      return [
+        'type: 0x', hex32(this.type),
+        ' (', this._type_name(this.type), ')',
+        ', length: ', this.total_length,
+        ', interface id: ', this.interface_id,
+        ', timestamp high: ', this.timestamp_h,
+        ', timestamp low: ', this.timestamp_l,
+        ', captured len: ', this.captured_len,
+        ', packet len: ', this.packet_len,
+        ', packet data: ', this._packet_data_summary(this.pakcet_data),
+        ', options: ', this.options
+      ].join('');
+    }
+  }
+
+  function get_block_length_from_header(arrayBuffer) {
+    if (arrayBuffer.byteLength < BLOCK_SIZE) {
+      throw new Error('invalid block');
+    }
+    var dataView = new DataViewEx(arrayBuffer);
+    var t = dataView.getUint32(0);
+    if (t == 0x0A0D0D0A) {
+      dataView.getByteOrderMagic(8);
+    }
+    var l = dataView.getUint32(4);
+    if (l <= BLOCK_SIZE) {
+      throw new Error('invalid block length');
+    }
+    return l;
+  }
+
+  function get_block_length_from_tail(arrayBuffer) {
+    if (arrayBuffer.byteLength < BLOCK_TAIL_SIZE) {
+      throw new Error('invalid block');
+    }
+    var dataView = new DataViewEx(arrayBuffer);
+    var l = dataView.getUint32(0);
+    if (l <= BLOCK_SIZE) {
+      throw new Error('invalid block length');
+    }
+    return l;
+  }
+
+  function get_block(arrayBuffer) {
+    var dataView = new DataViewEx(arrayBuffer);
+    var t = dataView.getUint32(0);
+    var blocks = {
+      0x00000001: InterfaceDescriptionBlock,
+      0x00000005: InterfaceStatisticsBlock,
+      0x00000006: EnhancedPacketBlock,
+      0x0A0D0D0A: SectionHeaderBlock
+    };
+    var block = blocks[t];
+    if (!block) {
+      block = GeneralBlock;
+    }
+    return new block(dataView);
+  }
+
+  function readBlock(file, start, stop) {
+    var reader = new FileReader();
+    reader.onloadend = function(e) {
+      if (e.target.readyState == FileReader.DONE) {
+        var block = get_block(e.target.result);
+        document.getElementById('block').textContent =
+          block.toString();
+        document.getElementById('range').textContent =
+          ['Read bytes: ', start + 1, ' - ', stop,
+          ' of ', file.size, ' byte file'].join('');
+        var prev = start - BLOCK_TAIL_SIZE;
+        if (prev < 0) {
+          prev = file.size - BLOCK_TAIL_SIZE;
+        }
+        var next = stop;
+        if (next >= file.size) {
+          next = 0;
+        }
+        document.getElementById('prev').setAttribute('startbyte', prev);
+        document.getElementById('next').setAttribute('startbyte', next);
+        document.getElementById('hexdump').textContent = hexDump(start, e.target.result);
+      }
+    };
+    reader.readAsArrayBuffer(file.slice(start, stop));
+  }
+
+  function readBlockHeader(file, start) {
+    var stop = start + BLOCK_SIZE;
+    var reader = new FileReader();
+    reader.onloadend = function(e) {
+      if (e.target.readyState == FileReader.DONE) {
+        try {
+          var l = get_block_length_from_header(e.target.result);
+          stop = start + l;
+          readBlock(file, start, stop);
+        }
+        catch(e) {
+          document.getElementById('block').textContent = e;
+        }
+      }
+    };
+    reader.readAsArrayBuffer(file.slice(start, stop));
+  }
+
+  function readBlockTail(file, start) {
+    var stop = start + BLOCK_TAIL_SIZE;
+    var reader = new FileReader();
+    reader.onloadend = function(e) {
+      if (e.target.readyState == FileReader.DONE) {
+        try {
+          var l = get_block_length_from_tail(e.target.result);
+          start = stop - l;
+          readBlock(file, start, stop);
+        }
+        catch(e) {
+          document.getElementById('block').textContent = e;
+        }
+      }
+    };
+    reader.readAsArrayBuffer(file.slice(start, stop));
+  }
+
+  document.querySelector('#files').addEventListener('change', function(e) {
+    var files = e.target.files;
+    if (!files.length) {
+      return;
+    }
+    readBlockHeader(files[0], 0);
+  }, false);
+
+  document.querySelector('#files').addEventListener('click', function(e) {
+    document.getElementById('files').value = '';
+    document.getElementById('block').textContent = '';
+    document.getElementById('range').textContent = '';
+    document.getElementById('hexdump').textContent = '';
+  }, false);
+
+  document.querySelector('#prev').addEventListener('click', function(e) {
+    var start = parseInt(e.target.getAttribute('startbyte'));
+    var files = document.getElementById('files').files;
+    if (!files.length) {
+      alert('Please select a file!');
+      return;
+    }
+    readBlockTail(files[0], start);
+  }, false);
+
+  document.querySelector('#next').addEventListener('click', function(e) {
+    var start = parseInt(e.target.getAttribute('startbyte'));
+    var files = document.getElementById('files').files;
+    if (!files.length) {
+      alert('Please select a file!');
+      return;
+    }
+    readBlockHeader(files[0], start);
+  }, false);
+</script>
